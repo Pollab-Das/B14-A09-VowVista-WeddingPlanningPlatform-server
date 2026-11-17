@@ -8,8 +8,13 @@ const app = express();
 const port = process.env.PORT || 5000;
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// CORS সেটআপ (Frontend থেকে কল করার জন্য)
+// ==========================================
+// ⚙️ MIDDLEWARES & CONFIG
+// ==========================================
 app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }));
+
+// Health check (সার্ভার ঠিক আছে কিনা চেক করার জন্য)
+app.get("/", (req, res) => res.send("VowVista API is running 💍"));
 
 // ==========================================
 // 🔗 MONGODB CONNECTION
@@ -391,7 +396,7 @@ app.patch("/admin/users/:id/block", verifyToken, verifyRole(["admin"]), async (r
   }
 });
 
-// ৪. Admin: সব সার্ভিস লিস্ট (Approve/Reject এর জন্য)
+// ৪. Admin: সব সার্ভিস লিস্ট
 app.get("/admin/services", verifyToken, verifyRole(["admin"]), async (req, res) => {
   try {
     const services = await collections.services.find().sort({ createdAt: -1 }).toArray();
@@ -410,7 +415,6 @@ app.get("/admin/transactions", verifyToken, verifyRole(["admin"]), async (req, r
     res.status(500).send({ message: "Failed to fetch transactions" });
   }
 });
-
 
 // ==========================================
 // 💳 STRIPE ROUTES
@@ -500,13 +504,14 @@ app.post("/payments/webhook", express.raw({ type: 'application/json' }), async (
   res.send({ received: true });
 });
 
-
 // ==========================================
 // 🚀 SERVER START
 // ==========================================
 async function startServer() {
   await connectDB();
-  app.use(express.json()); // সাধারণ রিকোয়েস্টের জন্য (Webhook এর বাইরে)
+  
+  // JSON parser সবার শেষে দিচ্ছি, তবে Webhook রুটে express.raw ব্যবহার করা হয়েছে তাই এটি Webhook এর জন্য কাজ করবে না
+  app.use(express.json());
   
   app.listen(port, () => {
     console.log(`🚀 VowVista server running on port ${port}`);
