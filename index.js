@@ -1,299 +1,300 @@
-import express from 'express';
-import cors from 'cors';
-import 'dotenv/config';
-import { MongoClient, ObjectId } from 'mongodb';
-import Stripe from 'stripe';
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+import express from "express";
+import cors from "cors";
+import "dotenv/config";
+import { MongoClient, ObjectId } from "mongodb";
+import Stripe from "stripe";
 
 const app = express();
 const port = process.env.PORT || 5000;
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// middleware
+// CORS সেটআপ
+app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }));
+
+// Health check (সার্ভার ঠিক আছে কিনা চেক করার জন্য)
+app.get("/", (req, res) => res.send("VowVista API is running 💍"));
+
+// MongoDB connection string
+const mongoUri =
+  process.env.MONGODB_URI || process.env.MONGO_URI ||
+  `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.rffvcgh.mongodb.net/?retryWrites=true&w=majority`;
+
+const client = new MongoClient(mongoUri);
+
+let db;
+let collections;
+
+// ফাংশন তৈরি করলাম যাতে ডাটাবেস কানেক্ট হওয়ার পরেই collections পাওয়া যায়
+async function connectDB() {
+  try {
+    await client.connect();
+    console.log("✅ Connected to MongoDB");
+    
+    // কানেকশন সফল হলে db এবং collections সেট হবে
+    db = client.db(process.env.DB_NAME || "vowvista");
+    collections = {
+      users: db.collection("user"),          // Better Auth-managed
+      sessions: db.collection("session"),    // Better Auth-managed
+      services: db.collection("services"),
+      bookings: db.collection("bookings"),
+      transactions: db.collection("transactions"),
+    };
+  } catch (error) {
+    console.error(`❌ MongoDB connection failed: ${error.message}`);
+    process.exit(1); // কানেকশন ফেইল করলে সার্ভার বন্ধ হয়ে যাবে
+  }
+}
+
+// JSON parser (webhook ছাড়া বাকি সব রুটের জন্য)
 app.use(express.json());
-app.use(cors());
 
-const client = new MongoClient(`mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.vyznij5.mongodb.net/`);
+// ==========================================
+// 🔐 AUTH & ROLE MIDDLEWARES
+// ==========================================
 
-
-const myLogger = (req, res, next) => {
-    console.log('now hitting api', req.url, req.headers)
-    next();
-}
-
-export async function connectToMongoDB() {
-    try {
-        await client.connect();
-        console.log("You successfully connected to MongoDB!");
-        return client;
-    } catch (err) {
-        console.dir(err);
-    }
-}
-
-const connectedClient = await connectToMongoDB();
-const database = connectedClient.db("hireloopdb");
-const users = database.collection("user");
-const sessions = database.collection("session");
-const jobs = database.collection("jobs");
-const applications = database.collection("applications");
-const payments = database.collection("payments");
-
-app.get('/', (req, res) => {
-    res.send('hire loop is looping')
-})
-
+// ১. টোকেন ভেরিফাই মিডলওয়্যার
 const verifyToken = async (req, res, next) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
-        res.status(401).send({ message: 'Unauthorized' });
-        return;
-    }
-    const token = authHeader.split(' ')[1];
-    if (!token) {
-        res.status(401).send({ message: 'Unauthorized' });
-        return;
-    }
+  const authHeader = req.headers.authorization;
+  
+  // টোকেন আছে কিনা চেক
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).send({ message: "Unauthorized: No token provided" });
+  }
 
-    const query = { token };
-    const session = await sessions.findOne(query);
+  const token = authHeader.split(" ")[1];
+
+  try {
+    // Better Auth-এর 'session' কালেকশনে টোকেন খুঁজছি
+    const session = await collections.sessions.findOne({ token });
     if (!session) {
-        res.status(401).send({ message: 'Unauthorized' });
-        return;
+      return res.status(401).send({ message: "Unauthorized: Invalid or expired token" });
     }
 
-    const userId = session.userId;
+    // টোকেন থেকে userId নিয়ে 'user' কালেকশন থেকে ডাটা বের করছি (স্ট্রিং থেকে ObjectId কনভার্ট করে)
+    const user = await collections.users.findOne({ _id: new ObjectId(session.userId) });
 
-    const userQuery = { _id: new ObjectId(userId) };
-    const user = await users.findOne(userQuery);
+    // ইউজার না থাকলে বা ব্লকড থাকলে আটকে দিচ্ছি
     if (!user) {
-        res.status(401).send({ message: 'Unauthorized' });
-        return;
+      return res.status(401).send({ message: "Unauthorized: User not found" });
+    }
+    if (user.isBlocked) {
+      return res.status(403).send({ message: "Forbidden: Your account has been blocked" });
     }
 
+    // সব ঠিক থাকলে ইউজারের ডাটা req.user-এ সেভ করছি
     req.user = user;
     next();
-}
+  } catch (error) {
+    console.error("Token verification error:", error);
+    return res.status(500).send({ message: "Internal Server Error" });
+  }
+};
 
-// must call this middleware after verifyToken
-const verifySeeker = async (req, res, next) => {
-    if (req.user.role !== 'seeker') {
-        res.status(403).send({ message: 'Forbidden' });
-        return;
+// ২. রোল ভেরিফাই মিডলওয়্যার (Vendor, Customer, Admin)
+const verifyRole = (roles) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).send({ message: "Unauthorized: User not authenticated" });
+    }
+    
+    // রোল ম্যাচ করছে কিনা চেক (সিঙ্গেল বা মাল্টিপল রোল সাপোর্ট করবে)
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).send({ message: "Forbidden: You do not have permission to access this resource" });
     }
     next();
-}
+  };
+};
 
-const verifyRecruiter = async (req, res, next) => {
-    if (req.user.role !== 'recruiter') {
-        res.status(403).send({ message: 'Forbidden' });
-        return;
+// ==========================================
+// 💍 SERVICES ROUTES
+// ==========================================
+
+// ১. Public API: সব Approved এবং Active সার্ভিস (সার্চ, ফিল্টার, সর্ট সহ)
+app.get("/services", async (req, res) => {
+  try {
+    const { search, category, location, sort } = req.query;
+    let query = { status: "approved", isActive: true }; // রিকোয়ারমেন্ট: শুধু Approved এবং Active
+
+    // সার্চ (সার্ভিসের নাম দিয়ে)
+    if (search) {
+      query.serviceName = { $regex: search, $options: "i" };
     }
-    next();
-}
 
-const verifyAdmin = async (req, res, next) => {
-    if (req.user.role !== 'admin') {
-        res.status(403).send({ message: 'Forbidden' });
-        return;
+    // ক্যাটাগরি ফিল্টার
+    if (category) {
+      query.category = category;
     }
-    next();
-}
 
-// users related apis
-app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
-    const cursor = users.find({});
-    const result = await cursor.toArray();
-    res.send(result);
-})
+    // লোকেশন ফিল্টার
+    if (location) {
+      query.location = { $regex: location, $options: "i" };
+    }
 
-app.get('/users/:id/premium', async (req, res) => {
+    // প্রাইস সর্টিং (ascending বা descending)
+    let sortOption = {};
+    if (sort === "asc") sortOption.price = 1;
+    if (sort === "desc") sortOption.price = -1;
+
+    const services = await collections.services.find(query).sort(sortOption).toArray();
+    res.send(services);
+  } catch (error) {
+    res.status(500).send({ message: "Failed to fetch services" });
+  }
+});
+
+// ২. Vendor API: নিজের সব সার্ভিস দেখা (Approved, Pending, Rejected)
+app.get("/services/vendor", verifyToken, verifyRole(["vendor"]), async (req, res) => {
+  try {
+    const services = await collections.services.find({ vendorId: req.user._id.toString() }).toArray();
+    res.send(services);
+  } catch (error) {
+    res.status(500).send({ message: "Failed to fetch vendor services" });
+  }
+});
+
+// ৩. Public API: একটি নির্দিষ্ট সার্ভিসের ডিটেইলস
+app.get("/services/:id", async (req, res) => {
+  try {
     const id = req.params.id;
-    const query = { _id: new ObjectId(id) };
-    const result = await users.findOne(query, { projection: { premium: 1 } });
-    res.send(result);
-})
+    // Invalid ObjectId চেক
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid Service ID format" });
+    }
 
-app.patch('/users/:id/role', verifyToken, verifyAdmin, async (req, res) => {
+    const service = await collections.services.findOne({ _id: new ObjectId(id) });
+    
+    if (!service) {
+      return res.status(404).send({ message: "Service not found" });
+    }
+    res.send(service);
+  } catch (error) {
+    res.status(500).send({ message: "Failed to fetch service details" });
+  }
+});
+
+// ৪. Vendor API: নতুন সার্ভিস তৈরি করা
+app.post("/services", verifyToken, verifyRole(["vendor"]), async (req, res) => {
+  try {
+    const { serviceName, category, description, price, location, images } = req.body;
+
+    // ফ্রি প্ল্যান লিমিট চেক (Maximum 3 active services)
+    if (req.user.subscriptionPlan !== "premium") {
+      const activeCount = await collections.services.countDocuments({
+        vendorId: req.user._id.toString(),
+        isActive: true,
+      });
+      if (activeCount >= 3) {
+        return res.status(403).send({ 
+          message: "Free plan limit reached. Upgrade to Premium to publish more than 3 active services." 
+        });
+      }
+    }
+
+    const newService = {
+      vendorId: req.user._id.toString(), // সার্ভার নিজে সেট করছে, ক্লায়েন্টের ওপর ভরসা না করে
+      serviceName,
+      category,
+      description,
+      price: Number(price),
+      location,
+      images: images || [], // ImgBB থেকে আসা ইমেজ URL
+      status: "pending",    // ডিফল্ট স্ট্যাটাস
+      isActive: true,
+      createdAt: new Date(),
+    };
+
+    const result = await collections.services.insertOne(newService);
+    res.status(201).send(result);
+  } catch (error) {
+    res.status(500).send({ message: "Failed to create service" });
+  }
+});
+
+// ৫. Vendor API: নিজের সার্ভিস আপডেট করা
+app.patch("/services/:id", verifyToken, verifyRole(["vendor"]), async (req, res) => {
+  try {
     const id = req.params.id;
-    const query = { _id: new ObjectId(id) };
+    if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid Service ID" });
+
+    const service = await collections.services.findOne({ _id: new ObjectId(id) });
+    if (!service) return res.status(404).send({ message: "Service not found" });
+
+    // Ownership Check: নিজের সার্ভিস কিনা
+    if (service.vendorId !== req.user._id.toString()) {
+      return res.status(403).send({ message: "Forbidden: You can only update your own services" });
+    }
+
+    // আপডেট ডাটা (vendorId বা status ক্লায়েন্ট পরিবর্তন করতে পারবে না, শুধু নির্দিষ্ট ফিল্ড)
     const updatedDoc = {
-        $set: {
-            role: req.body.role,
-        }
-    }
-    const result = await users.updateOne(query, updatedDoc);
+      $set: {
+        serviceName: req.body.serviceName || service.serviceName,
+        category: req.body.category || service.category,
+        description: req.body.description || service.description,
+        price: req.body.price ? Number(req.body.price) : service.price,
+        location: req.body.location || service.location,
+        images: req.body.images || service.images,
+        isActive: req.body.isActive !== undefined ? req.body.isActive : service.isActive,
+      }
+    };
+
+    const result = await collections.services.updateOne({ _id: new ObjectId(id) }, updatedDoc);
     res.send(result);
-})
+  } catch (error) {
+    res.status(500).send({ message: "Failed to update service" });
+  }
+});
 
-
-// jobs related apis
-app.get('/jobs', async (req, res) => {
-
-    const query = {};
-    // console.log('query', req.query);
-    if (req.query) {
-        if (req.query.jobType) {
-            query.jobType = req.query.jobType;
-        }
-        if (req.query.isRemote) {
-            query.isRemote = req.query.isRemote === 'true';
-        }
-        if (req.query.category) {
-            query.category = req.query.category;
-        }
-        if (req.query.recruiterId) {
-            query.recruiterId = req.query.recruiterId;
-        }
-        if (req.query.search) {
-            query.$or = [
-                { title: { $regex: req.query.search, $options: 'i' } },
-                { company: { $regex: req.query.search, $options: 'i' } },
-                { responsibilities: { $regex: req.query.search, $options: 'i' } },
-                { requirements: { $regex: req.query.search, $options: 'i' } }
-            ];
-        }
-    }
-
-    const cursor = jobs.find(query);
-    const result = await cursor.toArray();
-    res.send(result);
-})
-
-app.get(`/jobs/:id`, async (req, res) => {
+// ৬. Vendor API: নিজের সার্ভিস ডিলিট করা
+app.delete("/services/:id", verifyToken, verifyRole(["vendor"]), async (req, res) => {
+  try {
     const id = req.params.id;
-    const query = { _id: new ObjectId(id) };
-    const result = await jobs.findOne(query);
+    if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid Service ID" });
+
+    const service = await collections.services.findOne({ _id: new ObjectId(id) });
+    if (!service) return res.status(404).send({ message: "Service not found" });
+
+    // Ownership Check
+    if (service.vendorId !== req.user._id.toString()) {
+      return res.status(403).send({ message: "Forbidden: You can only delete your own services" });
+    }
+
+    const result = await collections.services.deleteOne({ _id: new ObjectId(id) });
     res.send(result);
-})
+  } catch (error) {
+    res.status(500).send({ message: "Failed to delete service" });
+  }
+});
 
-
-app.post('/jobs', verifyToken, verifyRecruiter, async (req, res) => {
-    const job = req.body;
-    const result = await jobs.insertOne(job);
-    res.send(result);
-})
-
-
-app.delete('/jobs/:id', async (req, res) => {
+// ৭. Admin API: সার্ভিস Approve / Reject করা
+app.patch("/services/:id/status", verifyToken, verifyRole(["admin"]), async (req, res) => {
+  try {
     const id = req.params.id;
-    const query = { _id: new ObjectId(id) };
-    const result = await jobs.deleteOne(query);
+    const { status } = req.body; // "approved" অথবা "rejected"
+
+    if (!["approved", "rejected"].includes(status)) {
+      return res.status(400).send({ message: "Invalid status value" });
+    }
+
+    const result = await collections.services.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status } }
+    );
     res.send(result);
-})
+  } catch (error) {
+    res.status(500).send({ message: "Failed to update service status" });
+  }
+});
 
 
-// applications related apis
+// ==========================================
+// 🚀 SERVER START
+// ==========================================
+async function startServer() {
+  await connectDB();
+  
+  app.listen(port, () => {
+    console.log(`🚀 VowVista server running on port ${port}`);
+  });
+}
 
-app.get('/applications', verifyToken, async (req, res) => {
-
-    const query = {};
-    if (req.query.applicantId) {
-        query.userId = req.query.applicantId;
-    }
-    if (req.query.jobId) {
-
-        const jobQuery = { _id: new ObjectId(req.query.jobId) };
-        const job = await jobs.findOne(jobQuery);
-        if (job.recruiterId !== req.user._id.toString() && req.user.role !=='admin' ) {
-            res.status(403).send({ message: 'Forbidden' });
-            return;
-        }
-
-        query.jobId = req.query.jobId;
-    }
-    const cursor = applications.find(query);
-    const result = await cursor.toArray();
-    res.send(result);
-})
-
-app.get('/applications/count', async (req, res) => {
-    const query = {};
-    if (req.query.applicantId) {
-        query.userId = req.query.applicantId;
-    }
-    const result = await applications.countDocuments(query);
-    res.send({ count: result });
-})
-
-app.post('/applications', verifyToken, verifySeeker, async (req, res) => {
-    const application = req.body;
-    const result = await applications.insertOne(application);
-    res.send(result);
-})
-
-app.patch('/applications/:id', async (req, res) => {
-    const id = req.params.id;
-    const query = { _id: new ObjectId(id) };
-    const updatedDoc = {
-        $set: {
-            status: req.body.status,
-        }
-    }
-    const result = await applications.updateOne(query, updatedDoc);
-    res.send(result);
-})
-
-// payments related apis
-app.post('/payments/checkout-verify', async (req, res) => {
-    const { sessionId } = req.body;
-
-    if (!sessionId) {
-        return res.send({ success: false, message: 'Session ID is required' });
-    }
-
-    const {
-        status,
-        payment_status,
-        customer_email,
-        metadata,
-        payment_intent,
-    } = await stripe.checkout.sessions.retrieve(sessionId);
-
-    // 1. is used new session 
-    // 2. check is the session id for the currently logged in user
-    // 3. insert sessionId into the payment Collection
-    // 4. update user information as premium user
-
-    if (status === 'complete' && payment_status === 'paid') {
-
-        const sessionQuery = { sessionId };
-        const existingPayment = await payments.findOne(sessionQuery);
-        if (existingPayment) {
-            return res.send({ success: false, message: 'Payment already verified' });
-        }
-        const payment = {
-            sessionId,
-            status,
-            payment_status,
-            customer_email,
-            userId: metadata.userId,
-            payment_date: new Date(),
-            payment_intent,
-        }
-
-        const result = await payments.insertOne(payment);
-
-        // update the user table
-        const query = { _id: new ObjectId(metadata.userId) };
-
-        const updatedDoc = {
-            $set: {
-                premium: true,
-            }
-        }
-        const updateResult = await users.updateOne(
-            query,
-            updatedDoc
-        );
-        res.send({ success: true, result, updateResult });
-        return
-    }
-    res.send({ success: false, message: 'Payment verification failed' });
-})
-
-app.listen(port, () => {
-    console.log(`hire loop is running on port ${port}`)
-})
-
-export default app;
+startServer();
